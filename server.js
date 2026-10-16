@@ -7,7 +7,13 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT;
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://playhub-backend1.onrender.com', // Your current live Vercel URL                      // Local frontend testing
+  ],
+  credentials: true
+}));
+
 
 // FIXED
 app.use(bodyParser.json({ limit: '100mb' }));
