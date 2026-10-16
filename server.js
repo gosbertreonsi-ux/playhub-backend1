@@ -10,7 +10,7 @@ const PORT = process.env.PORT;
 app.use(cors({
   origin: [
     'https://playhub-backend1.onrender.com', // current live backend
-    'http://localhost:3000', // local frontend dev  
+    'http://localhost:5001 ', // local frontend dev  
   ],
   credentials: true
 }));
