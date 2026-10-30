@@ -1,110 +1,276 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const { createClient } = require('@supabase/supabase-js');
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const { timingSafeEqual } = require("node:crypto");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-const PORT = process.env.PORT;
 
-app.use(cors({
-  origin: [
-    'https://playhub-backend1.onrender.com', // current live backend
-    'http://localhost:5001 ', // local frontend dev  
-  ],
-  credentials: true
-}));
+const PORT = Number(process.env.PORT) || 5001;
 
+const SUPABASE_URL =
+  process.env.SUPABASE_URL ||
+  process.env.NEXT_PUBLIC_SUPABASE_URL;
 
-// FIXED
-app.use(bodyParser.json({ limit: '100mb' }));
-app.use(bodyParser.urlencoded({ limit: '100mb', extended: true }));
+const SUPABASE_ANON_KEY =
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ;
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  throw new Error("Supabase environment configuration missing");
+}
 
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY
+);
 
-console.log("Secure Supabase Distributed Cloud Tunnel Connected.");
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
 
-// Fetch Shared Video Feed List
-app.get('/api/videos', async (req, res) => {
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("CORS origin not allowed"));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  })
+);
+
+app.use(bodyParser.json({ limit: "5mb" }));
+app.use(
+  bodyParser.urlencoded({
+    limit: "5mb",
+    extended: true,
+  })
+);
+
+function safeEqual(a, b) {
+  const first = Buffer.from(String(a));
+  const second = Buffer.from(String(b));
+
+  return (
+    first.length === second.length &&
+    timingSafeEqual(first, second)
+  );
+}
+
+function requireAdmin(req, res, next) {
+  const expected = process.env.ADMIN_API_TOKEN;
+
+  if (!expected || expected.length < 32) {
+    return res.status(503).json({
+      error: "Admin API authentication not configured",
+    });
+  }
+
+  const authorization = req.get("Authorization") || "";
+
+  if (!authorization.startsWith("Bearer ")) {
+    return res.status(401).json({
+      error: "Admin authentication required",
+    });
+  }
+
+  const supplied = authorization.slice("Bearer ".length);
+
+  if (!safeEqual(supplied, expected)) {
+    return res.status(401).json({
+      error: "Invalid admin credentials",
+    });
+  }
+
+  next();
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    name: "LeeHub Media API",
+    status: "online",
+  });
+});
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    success: true,
+    service: "leehub-backend",
+  });
+});
+
+// PUBLIC: fetch videos
+app.get("/api/videos", async (req, res) => {
   try {
     const { data, error } = await supabase
-      .from('videos')
-      .select('*')
-      .order('uploaded_at', { ascending: false });
+      .from("videos")
+      .select("*")
+      .order("uploaded_at", { ascending: false });
 
     if (error) throw error;
-    
-    const synchronizedFeed = data.map(v => ({
-      id: v.id,
-      title: v.title,
-      channel: v.channel,
-      length: v.length,
-      price: v.price,
-      desc: v.desc_source,
-      thumb: v.thumb,
-      uploadedAt: v.uploaded_at
+
+    const videos = (data || []).map((video) => ({
+      id: video.id,
+      title: video.title,
+      channel: video.channel,
+      length: video.length,
+      price: video.price,
+      desc: video.desc_source,
+      thumb: video.thumb,
+      uploadedAt: video.uploaded_at,
     }));
 
-    res.status(200).json(synchronizedFeed);
-  } catch (err) {
-    console.error("Database read extraction failure:", err.message);
-    res.status(500).json({ error: "Cloud sync failure." });
+    return res.status(200).json(videos);
+  } catch (error) {
+    console.error("Video fetch failed:", error.message);
+
+    return res.status(500).json({
+      error: "Unable to load videos",
+    });
   }
 });
 
-// Publish New Video Entry Universally
-app.post('/api/videos', async (req, res) => {
-  const { id, title, channel, length, price, desc, thumb, uploadedAt } = req.body;
-  if (!title || !channel) return res.status(400).json({ error: "Missing metadata fields." });
+// ADMIN ONLY: publish videos
+app.post("/api/videos", requireAdmin, async (req, res) => {
+  const {
+    id,
+    title,
+    channel,
+    length,
+    price,
+    desc,
+    thumb,
+    uploadedAt,
+  } = req.body || {};
+
+  if (
+    typeof title !== "string" ||
+    typeof channel !== "string" ||
+    !title.trim() ||
+    !channel.trim()
+  ) {
+    return res.status(400).json({
+      error: "Title and channel are required",
+    });
+  }
+
+  const numericPrice = Number(price ?? 0);
+
+  if (!Number.isFinite(numericPrice) || numericPrice < 0) {
+    return res.status(400).json({
+      error: "Invalid video price",
+    });
+  }
+
+  const video = {
+    id: id || `vid_${crypto.randomUUID()}`,
+    title: title.trim(),
+    channel: channel.trim(),
+    length: String(length || "0:00"),
+    price: String(numericPrice),
+    desc_source: String(desc || ""),
+    thumb: String(thumb || ""),
+    uploaded_at: uploadedAt || new Date().toISOString(),
+  };
 
   try {
     const { error } = await supabase
-      .from('videos')
-      .insert([{
-        id: id,
-        title: title,
-        channel: channel,
-        length: length,
-        price: price || '0',
-        desc_source: desc,
-        thumb: thumb,
-        uploaded_at: uploadedAt || new Date().toISOString()
-      }]);
+      .from("videos")
+      .insert([video]);
 
     if (error) throw error;
-    console.log(`[REAL-TIME SYNC] Successfully committed: "${title}" straight to cloud servers.`);
-    return res.status(201).json({ success: true });
-  } catch (err) {
-    console.error("Supabase insertion dropped payload reject:", err.message);
-    return res.status(500).json({ error: "Data pipeline execution exception." });
+
+    return res.status(201).json({
+      success: true,
+      id: video.id,
+    });
+  } catch (error) {
+    console.error("Video publish failed:", error.message);
+
+    return res.status(500).json({
+      error: "Unable to publish video",
+    });
   }
 });
 
-// FIXED DELETION
-app.delete('/api/videos/:id', async (req, res) => {
-  const targetId = req.params.id;
+// ADMIN ONLY: delete videos
+app.delete("/api/videos/:id", requireAdmin, async (req, res) => {
+  const { id } = req.params;
+
+  if (!id) {
+    return res.status(400).json({
+      error: "Video ID is required",
+    });
+  }
+
   try {
     const { error } = await supabase
-      .from('videos')
+      .from("videos")
       .delete()
-      .eq('id', targetId); // VIDEO ID TARGETING
+      .eq("id", id);
 
     if (error) throw error;
-    console.log(`[CLOUD DATA CLEAN] Purged video item ID [${targetId}] from databases.`);
-    return res.status(200).json({ success: true });
-  } catch (err) {
-    console.error("Target deletion loop aborted:", err.message);
-    return res.status(500).json({ error: "Purge process failure." });
+
+    return res.status(200).json({
+      success: true,
+      deletedId: id,
+    });
+  } catch (error) {
+    console.error("Video deletion failed:", error.message);
+
+    return res.status(500).json({
+      error: "Unable to delete video",
+    });
   }
 });
 
-app.get('/api/verify-video', (req, res) => { res.status(200).json({ purchased: false }); });
-app.post('/api/initialize-payment', (req, res) => { res.status(200).json({ success: true, redirectUrl: null }); });
-app.get('/api/check-payment-status', (req, res) => { res.status(200).json({ status: "completed", paid: true }); });
+// Existing endpoint retained. No payment entitlement
+// is granted until a verified payment integration exists.
+app.get("/api/verify-video", (req, res) => {
+  return res.status(200).json({
+    purchased: false,
+  });
+});
+
+// Payment integration not yet implemented.
+app.post("/api/initialize-payment", (req, res) => {
+  return res.status(501).json({
+    success: false,
+    error: "Payment gateway not configured",
+  });
+});
+
+app.get("/api/check-payment-status", (req, res) => {
+  return res.status(200).json({
+    status: "unverified",
+    paid: false,
+  });
+});
+
+// The existing homepage uses these paths.
+// Do not report fake successful transactions.
+app.post("/api/payments/initiate", (req, res) => {
+  return res.status(501).json({
+    success: false,
+    error: "Payment gateway not configured",
+  });
+});
+
+app.get("/api/payments/status/:id", (req, res) => {
+  return res.status(200).json({
+    status: "unverified",
+    paid: false,
+  });
+});
 
 app.listen(PORT, () => {
-  console.log(`PlayHub Core Systems Active & Listening on Port ${PORT}`);
+  console.log(`LeeHub Media backend running on port ${PORT}`);
 });
